@@ -1,0 +1,20 @@
+{
+  "name": "progressive-memory",
+  "version": "1.0.0",
+  "description": "Progressive memory system for OpenClaw agents",
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/index.ts --outdir=dist --target=bun",
+    "start": "bun run src/index.ts",
+    "classify": "bun run src/classify.ts",
+    "decay": "bun run src/decay.ts"
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.17.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.3",
+    "typescript": "^5.4.5"
+  }
+}

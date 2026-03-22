@@ -1,0 +1,58 @@
+{
+  "$schema": "https://openclaw.dev/schema/hooks.json",
+  "description": "Example hook registration for Progressive Memory v1",
+  "hooks": {
+    "preAgent": [
+      {
+        "name": "recall-memory",
+        "command": "bash",
+        "args": ["/home/sreeram/.openclaw/workspace/projects/progressive-memory/hooks/recall.sh"],
+        "env": {
+          "SESSION_ID": "{sessionId}",
+          "RECALL_QUERY": "{lastMessage}"
+        },
+        "timeout": 15000,
+        "capture": "stdout",
+        "inject": "prepend"
+      }
+    ],
+    "postAgent": [
+      {
+        "name": "retain-memory",
+        "command": "bash",
+        "args": ["/home/sreeram/.openclaw/workspace/projects/progressive-memory/hooks/retain.sh"],
+        "env": {
+          "SESSION_ID": "{sessionId}",
+          "RETAIN_TEXT": "{agentOutput}"
+        },
+        "timeout": 10000,
+        "capture": "stdout"
+      }
+    ],
+    "onError": [
+      {
+        "name": "log-case",
+        "command": "bash",
+        "args": ["/home/sreeram/.openclaw/workspace/projects/progressive-memory/hooks/case.sh"],
+        "env": {
+          "SESSION_ID": "{sessionId}",
+          "CASE_ERROR": "{errorMessage}"
+        },
+        "timeout": 10000,
+        "capture": "stdout"
+      }
+    ]
+  },
+  "cron": [
+    {
+      "name": "memory-decay",
+      "schedule": "0 3 * * *",
+      "command": "bash",
+      "args": ["/home/sreeram/.openclaw/workspace/projects/progressive-memory/hooks/decay.sh"],
+      "env": {
+        "DECAY_RATE": "0.05"
+      },
+      "timeout": 300000
+    }
+  ]
+}
