@@ -1,12 +1,16 @@
 export interface MemoryEntry {
   id: string;
   content: string;
+  content_hash?: string;
   statement_type: "fact" | "belief" | "preference" | "intent" | "rule" | "pattern" | "question" | "unknown";
   subject_type: "self" | "human" | "codebase" | "system" | "external";
   scope: "session" | "project" | "global";
   layer: "awareness" | "active" | "archive";
   confidence: number;
   created_at: string;
+  first_seen_at?: string;
+  last_seen_at?: string;
+  repeat_count?: number;
   source_session: string;
   tags: string[];
 }

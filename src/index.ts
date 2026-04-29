@@ -1,4 +1,4 @@
-import { retain, recall, classify, decay, getAwareness, logCase, initCollections, count } from "./service.js";
+import { retain, recall, classify, decay, getAwareness, logCase, initCollections, count, dedupeBrain } from "./service.js";
 
 const cmd = process.argv[2]?.trim();
 const args = process.argv.slice(3);
@@ -79,8 +79,14 @@ async function main() {
       break;
     }
 
+    case "dedupe": {
+      const result = await dedupeBrain();
+      console.log(JSON.stringify(result));
+      break;
+    }
+
     default:
-      console.error(`Commands: init, retain, recall, classify, decay, awareness, case, count`);
+      console.error(`Commands: init, retain, recall, classify, decay, awareness, case, count, dedupe`);
       process.exit(1);
   }
 }

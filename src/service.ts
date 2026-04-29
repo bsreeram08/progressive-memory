@@ -78,39 +78,65 @@ async function collectionExists(name: string): Promise<boolean> {
 
 // ─── Retain ───────────────────────────────────────────────────────────────────
 
+function normalizeContent(content: string): string {
+  return content.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function hashContent(content: string): Promise<string> {
+  const bytes = new TextEncoder().encode(content);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export async function retain(
   content: string,
   metadata: MemoryMetadata = {}
 ): Promise<string> {
   const classification = await classifyText(content);
+  const normalized = normalizeContent(content);
+  const contentHash = await hashContent(normalized);
   const embedding = await getEmbedding(content).catch(() => null);
+  const now = new Date().toISOString();
+
+  const existing = await client.retrieve(COLLECTION_ACTIVE, {
+    ids: [contentHash],
+    with_payload: true,
+    with_vector: false,
+  }).catch(() => []);
+
+  const existingPayload = (existing[0]?.payload ?? {}) as Record<string, unknown>;
+  const repeatCount = typeof existingPayload.repeat_count === "number" ? existingPayload.repeat_count + 1 : 1;
+  const firstSeenAt = typeof existingPayload.first_seen_at === "string" ? existingPayload.first_seen_at : now;
+  const lastSeenAt = now;
 
   const entry: Record<string, unknown> = {
     content,
+    content_hash: contentHash,
     statement_type: metadata.statement_type ?? classification.statement_type,
     subject_type: metadata.subject_type ?? classification.subject_type,
     scope: metadata.scope ?? classification.scope,
     layer: metadata.layer ?? "active",
     confidence: metadata.confidence ?? classification.confidence,
-    created_at: new Date().toISOString(),
-    source_session: metadata.source_session ?? "unknown",
-    tags: metadata.tags ?? [],
+    created_at: typeof existingPayload.created_at === "string" ? existingPayload.created_at : now,
+    first_seen_at: firstSeenAt,
+    last_seen_at: lastSeenAt,
+    repeat_count: repeatCount,
+    source_session: metadata.source_session ?? existingPayload.source_session ?? "unknown",
+    tags: Array.from(new Set([...(metadata.tags ?? []), ...((existingPayload.tags as string[] | undefined) ?? [])])),
   };
-
-  const id = crypto.randomUUID();
 
   await client.upsert(COLLECTION_ACTIVE, {
     wait: true,
     points: [
       {
-        id,
+        id: contentHash,
         vector: embedding?.embedding ?? new Array(EMBEDDING_DIM).fill(0),
         payload: entry,
       },
     ],
   });
 
-  return id;
+  return contentHash;
 }
 
 // ─── Recall ───────────────────────────────────────────────────────────────────
@@ -185,13 +211,13 @@ export async function decay(decayRate = 0.05): Promise<{
       offset,
     });
 
-    for (const point of result.results ?? []) {
+    for (const point of result.points ?? []) {
       const confidence = (point.payload?.confidence as number) ?? 1.0;
       const newConfidence = +(confidence - decayRate).toFixed(4);
       toUpdate.push({ id: point.id as string, payload: point.payload as Record<string, unknown>, newConfidence });
     }
 
-    offset = result.next_page_offset;
+    offset = result.next_page_offset as string | undefined;
   } while (offset);
 
   let archived = 0;
@@ -266,6 +292,70 @@ export async function logCase(
   });
 
   return id;
+}
+
+// ─── Dedupe ───────────────────────────────────────────────────────────────────
+
+function parseCreatedAt(createdAt: unknown): number {
+  const ts = typeof createdAt === "string" ? Date.parse(createdAt) : Number.NaN;
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+async function dedupeCollection(collection: string): Promise<{
+  scanned: number;
+  groups: number;
+  deleted: number;
+}> {
+  let offset: string | undefined;
+  const groups = new Map<string, Array<{ id: string; confidence: number; createdAt: number }>>();
+  let scanned = 0;
+
+  do {
+    const result = await client.scroll(collection, {
+      with_payload: true,
+      limit: 256,
+      offset,
+    });
+
+    for (const point of result.points ?? []) {
+      scanned++;
+      const payload = point.payload as Record<string, unknown> | undefined;
+      const content = typeof payload?.content === "string" ? payload.content : "";
+      if (!content.trim()) continue;
+      const key = normalizeContent(content);
+      const confidence = typeof payload?.confidence === "number" ? payload.confidence : 0;
+      const createdAt = parseCreatedAt(payload?.created_at);
+      const bucket = groups.get(key) ?? [];
+      bucket.push({ id: point.id as string, confidence, createdAt });
+      groups.set(key, bucket);
+    }
+
+    offset = result.next_page_offset as string | undefined;
+  } while (offset);
+
+  const toDelete: string[] = [];
+  for (const bucket of Array.from(groups.values())) {
+    if (bucket.length <= 1) continue;
+    bucket.sort((a, b) => b.confidence - a.confidence || b.createdAt - a.createdAt);
+    toDelete.push(...bucket.slice(1).map((x) => x.id));
+  }
+
+  for (let i = 0; i < toDelete.length; i += 128) {
+    const chunk = toDelete.slice(i, i + 128);
+    await client.delete(collection, { wait: true, points: chunk });
+  }
+
+  return { scanned, groups: Array.from(groups.values()).filter((bucket) => bucket.length > 1).length, deleted: toDelete.length };
+}
+
+export async function dedupeBrain(): Promise<{
+  active: { scanned: number; groups: number; deleted: number };
+  archive: { scanned: number; groups: number; deleted: number };
+}> {
+  return {
+    active: await dedupeCollection(COLLECTION_ACTIVE),
+    archive: await dedupeCollection(COLLECTION_ARCHIVE),
+  };
 }
 
 // ─── Count ────────────────────────────────────────────────────────────────────
