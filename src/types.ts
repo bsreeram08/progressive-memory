@@ -1,3 +1,10 @@
+export interface MemoryLink {
+  id: string;
+  kind: "semantic" | "topic" | "session" | "same_subject" | "same_scope";
+  score: number;
+  reason: string;
+}
+
 export interface MemoryEntry {
   id: string;
   content: string;
@@ -13,6 +20,8 @@ export interface MemoryEntry {
   repeat_count?: number;
   source_session: string;
   tags: string[];
+  links?: MemoryLink[];
+  link_count?: number;
 }
 
 export interface MemoryMetadata {

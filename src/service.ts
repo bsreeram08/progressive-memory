@@ -4,6 +4,7 @@ import type {
   MemoryMetadata,
   RecallFilters,
   ClassificationResult,
+  MemoryLink,
 } from "./types.js";
 import { classifyText } from "./classify.js";
 import { getEmbedding } from "./embed.js";
@@ -88,6 +89,113 @@ async function hashContent(content: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((x): x is string => typeof x === "string") : [];
+}
+
+function asMemoryLinks(value: unknown): MemoryLink[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => item as Partial<MemoryLink>)
+    .filter((item): item is MemoryLink =>
+      typeof item?.id === "string" &&
+      typeof item?.kind === "string" &&
+      typeof item?.reason === "string" &&
+      typeof item?.score === "number"
+    );
+}
+
+function mergeLinks(existing: MemoryLink[] | undefined, next: MemoryLink[]): MemoryLink[] {
+  const map = new Map<string, MemoryLink>();
+  for (const link of existing ?? []) {
+    map.set(`${link.id}:${link.kind}`, link);
+  }
+  for (const link of next) {
+    const key = `${link.id}:${link.kind}`;
+    const current = map.get(key);
+    if (!current || link.score > current.score) map.set(key, link);
+  }
+  return Array.from(map.values()).sort((a, b) => b.score - a.score).slice(0, 8);
+}
+
+function pointToMemoryEntry(point: { id: string | number; payload?: Record<string, unknown> | null }): MemoryEntry {
+  const payload = point.payload ?? {};
+  return {
+    id: String(point.id),
+    content: typeof payload.content === "string" ? payload.content : "",
+    content_hash: typeof payload.content_hash === "string" ? payload.content_hash : undefined,
+    statement_type: (payload.statement_type as MemoryEntry["statement_type"]) ?? "unknown",
+    subject_type: (payload.subject_type as MemoryEntry["subject_type"]) ?? "external",
+    scope: (payload.scope as MemoryEntry["scope"]) ?? "session",
+    layer: (payload.layer as MemoryEntry["layer"]) ?? "active",
+    confidence: typeof payload.confidence === "number" ? payload.confidence : 0,
+    created_at: typeof payload.created_at === "string" ? payload.created_at : new Date().toISOString(),
+    first_seen_at: typeof payload.first_seen_at === "string" ? payload.first_seen_at : undefined,
+    last_seen_at: typeof payload.last_seen_at === "string" ? payload.last_seen_at : undefined,
+    repeat_count: typeof payload.repeat_count === "number" ? payload.repeat_count : undefined,
+    source_session: typeof payload.source_session === "string" ? payload.source_session : "unknown",
+    tags: toStringArray(payload.tags),
+    links: asMemoryLinks(payload.links),
+    link_count: typeof payload.link_count === "number" ? payload.link_count : asMemoryLinks(payload.links).length,
+  };
+}
+
+async function buildMemoryLinks(params: {
+  contentHash: string;
+  content: string;
+  metadata: MemoryMetadata;
+  embedding: number[] | null;
+}): Promise<MemoryLink[]> {
+  const { contentHash, metadata, embedding } = params;
+  if (!embedding || embedding.every((n) => n === 0)) return [];
+
+  const response = await client.search(COLLECTION_ACTIVE, {
+    vector: embedding,
+    limit: 8,
+    with_payload: true,
+  }).catch(() => [] as any[]);
+
+  const links: MemoryLink[] = [];
+  const sourceTags = new Set(metadata.tags ?? []);
+  for (const point of response as any[]) {
+    const id = String(point.id ?? "");
+    if (!id || id === contentHash) continue;
+    const payload = (point.payload ?? {}) as Record<string, unknown>;
+    const score = typeof point.score === "number" ? point.score : 0;
+    const candidateTags = toStringArray(payload.tags);
+    const sharedTags = candidateTags.filter((t) => sourceTags.has(t));
+    const sameSession = typeof payload.source_session === "string" && payload.source_session === metadata.source_session;
+    const sameSubject = typeof payload.subject_type === "string" && payload.subject_type === metadata.subject_type;
+    const sameScope = typeof payload.scope === "string" && payload.scope === metadata.scope;
+
+    let kind: MemoryLink["kind"] | null = null;
+    let reason = "";
+
+    if (sameSession) {
+      kind = "session";
+      reason = "same source session";
+    } else if (sharedTags.length > 0) {
+      kind = "topic";
+      reason = `shared tags: ${sharedTags.slice(0, 3).join(", ")}`;
+    } else if (sameSubject && score >= 0.82) {
+      kind = "same_subject";
+      reason = `same subject_type (${metadata.subject_type})`;
+    } else if (sameScope && score >= 0.84) {
+      kind = "same_scope";
+      reason = `same scope (${metadata.scope})`;
+    } else if (score >= 0.87) {
+      kind = "semantic";
+      reason = `semantic similarity ${score.toFixed(2)}`;
+    }
+
+    if (!kind) continue;
+    links.push({ id, kind, score, reason });
+    if (links.length >= 5) break;
+  }
+
+  return links;
+}
+
 export async function retain(
   content: string,
   metadata: MemoryMetadata = {}
@@ -95,19 +203,22 @@ export async function retain(
   const classification = await classifyText(content);
   const normalized = normalizeContent(content);
   const contentHash = await hashContent(normalized);
-  const embedding = await getEmbedding(content).catch(() => null);
+  const embeddingResult = await getEmbedding(content).catch(() => null);
+  const embedding = embeddingResult?.embedding ?? null;
   const now = new Date().toISOString();
 
   const existing = await client.retrieve(COLLECTION_ACTIVE, {
     ids: [contentHash],
     with_payload: true,
     with_vector: false,
-  }).catch(() => []);
+  }).catch(() => [] as any[]);
 
-  const existingPayload = (existing[0]?.payload ?? {}) as Record<string, unknown>;
+  const existingPayload = ((existing[0] as any)?.payload ?? {}) as Record<string, unknown>;
   const repeatCount = typeof existingPayload.repeat_count === "number" ? existingPayload.repeat_count + 1 : 1;
   const firstSeenAt = typeof existingPayload.first_seen_at === "string" ? existingPayload.first_seen_at : now;
   const lastSeenAt = now;
+  const newLinks = await buildMemoryLinks({ contentHash, content, metadata, embedding });
+  const mergedLinks = mergeLinks(asMemoryLinks(existingPayload.links), newLinks);
 
   const entry: Record<string, unknown> = {
     content,
@@ -122,7 +233,9 @@ export async function retain(
     last_seen_at: lastSeenAt,
     repeat_count: repeatCount,
     source_session: metadata.source_session ?? existingPayload.source_session ?? "unknown",
-    tags: Array.from(new Set([...(metadata.tags ?? []), ...((existingPayload.tags as string[] | undefined) ?? [])])),
+    tags: Array.from(new Set([...(metadata.tags ?? []), ...toStringArray(existingPayload.tags)])),
+    links: mergedLinks,
+    link_count: mergedLinks.length,
   };
 
   await client.upsert(COLLECTION_ACTIVE, {
@@ -130,7 +243,7 @@ export async function retain(
     points: [
       {
         id: contentHash,
-        vector: embedding?.embedding ?? new Array(EMBEDDING_DIM).fill(0),
+        vector: embedding ?? new Array(EMBEDDING_DIM).fill(0),
         payload: entry,
       },
     ],
@@ -153,35 +266,70 @@ function buildFilter(filters: RecallFilters) {
   return must.length > 0 ? { must } : undefined;
 }
 
+async function expandWithLinkedMemories(entries: MemoryEntry[], limit: number): Promise<MemoryEntry[]> {
+  const seen = new Set(entries.map((e) => e.id));
+  const output = [...entries];
+  const linkedIds = new Set<string>();
+
+  for (const entry of entries) {
+    for (const link of entry.links ?? []) {
+      if (!seen.has(link.id)) linkedIds.add(link.id);
+    }
+  }
+
+  if (linkedIds.size === 0 || output.length >= limit) return output.slice(0, limit);
+
+  const related = await client.retrieve(COLLECTION_ACTIVE, {
+    ids: Array.from(linkedIds).slice(0, Math.max(limit - output.length, 0) * 2 || limit),
+    with_payload: true,
+    with_vector: false,
+  }).catch(() => [] as any[]);
+
+  for (const point of related as any[]) {
+    const entry = pointToMemoryEntry(point);
+    if (seen.has(entry.id) || !entry.content.trim()) continue;
+    seen.add(entry.id);
+    output.push(entry);
+    if (output.length >= limit) break;
+  }
+
+  return output.slice(0, limit);
+}
+
 export async function recall(
   query: string,
   filters: RecallFilters = {},
   limit = 10
 ): Promise<MemoryEntry[]> {
   const filter = buildFilter(filters);
+  const queryEmbedding = (await getEmbedding(query).catch(() => null))?.embedding ?? new Array(EMBEDDING_DIM).fill(0);
+
+  let base: MemoryEntry[] = [];
 
   // Tier 1: payload filters first
   if (filter) {
     const tier1 = await client.search(COLLECTION_ACTIVE, {
-      vector: (await getEmbedding(query).catch(() => null))?.embedding ?? new Array(EMBEDDING_DIM).fill(0),
+      vector: queryEmbedding,
       limit,
       filter,
       with_payload: true,
     });
     if (tier1.length > 0) {
-      return tier1.map((r) => r.payload as unknown as MemoryEntry);
+      base = tier1.map((r) => pointToMemoryEntry(r as any));
+      return expandWithLinkedMemories(base, limit);
     }
   }
 
   // Tier 2: vector search
   const tier2 = await client.search(COLLECTION_ACTIVE, {
-    vector: (await getEmbedding(query).catch(() => null))?.embedding ?? new Array(EMBEDDING_DIM).fill(0),
+    vector: queryEmbedding,
     limit,
     filter,
     with_payload: true,
   });
 
-  return tier2.map((r) => r.payload as unknown as MemoryEntry);
+  base = tier2.map((r) => pointToMemoryEntry(r as any));
+  return expandWithLinkedMemories(base, limit);
 }
 
 // ─── Classify ─────────────────────────────────────────────────────────────────
